@@ -845,22 +845,10 @@ static const char *xml_local_name(const char *name) {
     return colon ? colon + 1 : (name ? name : "");
 }
 
-static bool xml_name_is(const char *name, const char *want) {
-    return strcasecmp(xml_local_name(name), want) == 0;
-}
-
 static const char *xml_attr_get(const char **attrs, const char *name) {
     if (!attrs || !name) return NULL;
     for (size_t i = 0; attrs[i] && attrs[i + 1]; i += 2) {
         if (strcasecmp(xml_local_name(attrs[i]), name) == 0) return attrs[i + 1];
-    }
-    return NULL;
-}
-
-static const char *xml_attr_get_any(const char **attrs, const char *const *names, size_t count) {
-    for (size_t i = 0; i < count; ++i) {
-        const char *v = xml_attr_get(attrs, names[i]);
-        if (v && *v) return v;
     }
     return NULL;
 }
@@ -886,6 +874,7 @@ static char *find_file_with_ext(const char *dir, const char *want_substr, const 
 struct xml_manifest_ctx {
     const char *image_dir;
     struct manifest *manifest;
+    bool storage_type_seen;
     bool fip_added;
 };
 
@@ -900,16 +889,16 @@ static void manifest_add_file(struct xml_manifest_ctx *x, const char *file) {
 }
 
 static void xml_start_element(void *user_data, const XML_Char *name, const XML_Char **attrs) {
+    (void)name;
     struct xml_manifest_ctx *x = (struct xml_manifest_ctx *)user_data;
     if (!x || !x->manifest) return;
 
-    if (xml_name_is(name, "storage")) {
-        const char *const names[] = {"type", "storage", "name"};
-        const char *storage = xml_attr_get_any((const char **)attrs, names, sizeof(names) / sizeof(names[0]));
+    if (!x->storage_type_seen) {
+        const char *storage = xml_attr_get((const char **)attrs, "type");
         if (storage && *storage) {
             snprintf(x->manifest->storage, sizeof(x->manifest->storage), "%s", storage);
-            /* Original xml_parse_to_list() prepends fip.bin when storage type is emmc. */
-            if (!x->fip_added && strcasecmp(storage, "emmc") == 0) {
+            x->storage_type_seen = true;
+            if (!x->fip_added && strncmp(storage, "emmc", 4) == 0) {
                 manifest_add_file(x, "fip.bin");
                 x->fip_added = true;
             }
@@ -917,23 +906,17 @@ static void xml_start_element(void *user_data, const XML_Char *name, const XML_C
         return;
     }
 
-    if (!xml_name_is(name, "partition")) return;
-
-    const char *const size_kb_names[] = {"size_in_kb", "size_kb"};
-    const char *szkb = xml_attr_get_any((const char **)attrs, size_kb_names, sizeof(size_kb_names) / sizeof(size_kb_names[0]));
+    const char *szkb = xml_attr_get((const char **)attrs, "size_in_kb");
     if (!szkb || !*szkb || parse_u64_auto(szkb) == 0) return;
 
-    const char *const file_names[] = {"file", "filename", "image"};
-    const char *file = xml_attr_get_any((const char **)attrs, file_names, sizeof(file_names) / sizeof(file_names[0]));
-    if (!file || !*file || strcmp(file, "-") == 0 || strcasecmp(file, "none") == 0) return;
+    const char *file = xml_attr_get((const char **)attrs, "file");
+    if (!file || !*file) return;
 
-    /* Original Linux XML parser does not feed address/size into CIMG chunk headers. */
     manifest_add_file(x, file);
 }
 
 static int parse_manifest_xml(const char *image_dir, struct manifest *m) {
     memset(m, 0, sizeof(*m));
-    snprintf(m->storage, sizeof(m->storage), "emmc");
 
     char *xml = find_file_with_ext(image_dir, "partition", ".xml", NULL);
     if (!xml) xml = find_file_with_ext(image_dir, NULL, ".xml", NULL);
@@ -958,6 +941,7 @@ static int parse_manifest_xml(const char *image_dir, struct manifest *m) {
     struct xml_manifest_ctx x = {
         .image_dir = image_dir,
         .manifest = m,
+        .storage_type_seen = false,
         .fip_added = false,
     };
     XML_SetUserData(parser, &x);
@@ -1178,7 +1162,8 @@ static void calculate_all_file_size(struct usbdl *c, const struct manifest *m) {
 }
 
 static bool is_fip_name(const char *file) {
-    return file && strcmp(file, "fip.bin") == 0;
+    /* Vendor usb_uboot_dl() uses memcmp(file, "fip.bin", 7). */
+    return file && memcmp(file, "fip.bin", 7) == 0;
 }
 
 static int send_fip_uboot_entry(struct usbdl *c, const struct opts *o, const struct image_entry *e, uint64_t update_addr) {
